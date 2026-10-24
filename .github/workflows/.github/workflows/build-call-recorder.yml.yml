@@ -1,0 +1,1426 @@
+name: Build Call Recorder Pro APK
+
+# How to use: put this file at .github/workflows/build-call-recorder.yml in a GitHub repo,
+# push it, then open the Actions tab. The APK appears under Artifacts and under Releases.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Accept Android licenses and install platform
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platforms;android-34" "build-tools;34.0.0" > /dev/null 2>&1 || true
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Generate project files
+        run: |
+          mkdir -p CallRecorderPro CallRecorderPro/app CallRecorderPro/app/src/main CallRecorderPro/app/src/main/java/com/hiddeninfo/callrecorder CallRecorderPro/app/src/main/res/drawable CallRecorderPro/app/src/main/res/mipmap-anydpi-v26 CallRecorderPro/app/src/main/res/values
+          cat > CallRecorderPro/app/build.gradle.kts <<'KTEOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.hiddeninfo.callrecorder"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.hiddeninfo.callrecorder"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                      signingConfig = signingConfigs.getByName("debug")
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+              buildFeatures {
+                  compose = true
+              }
+              composeOptions {
+                  kotlinCompilerExtensionVersion = "1.5.14"
+              }
+              lint {
+                  abortOnError = false
+                  checkReleaseBuilds = false
+              }
+              packaging {
+                  resources {
+                      excludes += "/META-INF/{AL2.0,LGPL2.1}"
+                  }
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-compose:1.9.1")
+              implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.foundation:foundation")
+              implementation("androidx.compose.material3:material3")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+          }
+          KTEOF
+          cat > CallRecorderPro/app/src/main/AndroidManifest.xml <<'KTEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+              <uses-permission android:name="android.permission.READ_CALL_LOG" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.VIBRATE" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher"
+                  android:label="@string/app_name"
+                  android:theme="@style/Theme.App">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTop"
+                      android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode|density">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".CallRecService"
+                      android:exported="false"
+                      android:foregroundServiceType="microphone" />
+              </application>
+          </manifest>
+          KTEOF
+          cat > CallRecorderPro/app/src/main/java/com/hiddeninfo/callrecorder/CallRecService.kt <<'KTEOF'
+          package com.hiddeninfo.callrecorder
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.ContentResolver
+          import android.content.ContentValues
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.content.pm.ServiceInfo
+          import android.graphics.drawable.Icon
+          import android.media.MediaRecorder
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Environment
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.os.ParcelFileDescriptor
+          import android.os.SystemClock
+          import android.provider.CallLog
+          import android.provider.MediaStore
+          import android.telephony.PhoneStateListener
+          import android.telephony.TelephonyCallback
+          import android.telephony.TelephonyManager
+          import android.widget.Toast
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          class CallRecService : Service() {
+
+              companion object {
+                  const val ACTION_LISTEN = "com.hiddeninfo.callrecorder.LISTEN"
+                  const val ACTION_STOP_LISTEN = "com.hiddeninfo.callrecorder.STOP_LISTEN"
+                  const val ACTION_REC_NOW = "com.hiddeninfo.callrecorder.REC_NOW"
+                  const val ACTION_REC_STOP = "com.hiddeninfo.callrecorder.REC_STOP"
+                  const val CH_REC = "callrec_channel"
+                  const val CH_DONE = "callrec_done"
+                  const val NID = 201
+                  const val DONE_ID = 202
+              }
+
+              private var settings = CallSettings()
+              private var recorder: MediaRecorder? = null
+              private var pfd: ParcelFileDescriptor? = null
+              private var outUri: Uri? = null
+              private var recStartMs = 0L
+              private var peak = 0
+              private var isCall = false
+              private var cb: Any? = null
+              private var fgOk = false
+              private val handler = Handler(Looper.getMainLooper())
+
+              private fun t(en: String, bn: String): String = if (settings.bengali) bn else en
+
+              private val ticker = object : Runnable {
+                  override fun run() {
+                      if (CR.recording) {
+                          CR.elapsedMs = SystemClock.elapsedRealtime() - recStartMs
+                          try {
+                              val a = recorder?.maxAmplitude ?: 0
+                              if (a > peak) peak = a
+                          } catch (e: Exception) {
+                          }
+                          handler.postDelayed(this, 500)
+                      }
+                  }
+              }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  settings = Prefs.load(this)
+                  when (intent?.action) {
+                      ACTION_LISTEN -> {
+                          if (ensureForeground()) startListening()
+                      }
+                      ACTION_REC_NOW -> {
+                          if (ensureForeground()) startRec(false)
+                      }
+                      ACTION_REC_STOP -> if (CR.recording) stopRec()
+                      ACTION_STOP_LISTEN -> stopListening()
+                      else -> if (!CR.listening && !CR.recording) stopSelf()
+                  }
+                  return START_NOT_STICKY
+              }
+
+              private fun ensureForeground(): Boolean {
+                  createChannels()
+                  try {
+                      if (Build.VERSION.SDK_INT >= 30) {
+                          startForeground(NID, buildNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+                      } else {
+                          startForeground(NID, buildNotification())
+                      }
+                      fgOk = true
+                      return true
+                  } catch (e: Exception) {
+                      Toast.makeText(this, t("Cannot start: ", "চালু করা যায়নি: ") + e.message, Toast.LENGTH_LONG).show()
+                      stopSelf()
+                      return false
+                  }
+              }
+
+              // --------------------------------------------------------- call listener
+              @Suppress("DEPRECATION")
+              private fun startListening() {
+                  if (CR.listening) {
+                      updateNotification()
+                      return
+                  }
+                  try {
+                      val tm = getSystemService(TELEPHONY_SERVICE) as TelephonyManager
+                      if (Build.VERSION.SDK_INT >= 31) {
+                          val c = object : TelephonyCallback(), TelephonyCallback.CallStateListener {
+                              override fun onCallStateChanged(state: Int) {
+                                  handleState(state)
+                              }
+                          }
+                          tm.registerTelephonyCallback(mainExecutor, c)
+                          cb = c
+                      } else {
+                          val l = object : PhoneStateListener() {
+                              override fun onCallStateChanged(state: Int, phoneNumber: String?) {
+                                  handleState(state)
+                              }
+                          }
+                          tm.listen(l, PhoneStateListener.LISTEN_CALL_STATE)
+                          cb = l
+                      }
+                      CR.listening = true
+                      updateNotification()
+                  } catch (e: Exception) {
+                      Toast.makeText(this, t("Phone permission needed", "ফোন পারমিশন দরকার"), Toast.LENGTH_LONG).show()
+                      stopListening()
+                  }
+              }
+
+              @Suppress("DEPRECATION")
+              private fun unregisterCalls() {
+                  try {
+                      val tm = getSystemService(TELEPHONY_SERVICE) as TelephonyManager
+                      val c = cb
+                      if (Build.VERSION.SDK_INT >= 31 && c is TelephonyCallback) {
+                          tm.unregisterTelephonyCallback(c)
+                      } else if (c is PhoneStateListener) {
+                          tm.listen(c, PhoneStateListener.LISTEN_NONE)
+                      }
+                  } catch (e: Exception) {
+                  }
+                  cb = null
+              }
+
+              private fun stopListening() {
+                  unregisterCalls()
+                  CR.listening = false
+                  if (CR.recording) stopRec()
+                  try {
+                      stopForeground(STOP_FOREGROUND_REMOVE)
+                  } catch (e: Exception) {
+                  }
+                  stopSelf()
+              }
+
+              private fun handleState(state: Int) {
+                  settings = Prefs.load(this)
+                  if (state == TelephonyManager.CALL_STATE_OFFHOOK) {
+                      if (!CR.recording) startRec(true)
+                  } else if (state == TelephonyManager.CALL_STATE_IDLE) {
+                      if (CR.recording && isCall) stopRec()
+                  }
+              }
+
+              // ------------------------------------------------------------- recording
+              private fun sourceConst(i: Int): Int = when (i) {
+                  1 -> MediaRecorder.AudioSource.VOICE_RECOGNITION
+                  2 -> MediaRecorder.AudioSource.VOICE_COMMUNICATION
+                  3 -> MediaRecorder.AudioSource.CAMCORDER
+                  4 -> MediaRecorder.AudioSource.UNPROCESSED
+                  else -> MediaRecorder.AudioSource.MIC
+              }
+
+              @Suppress("DEPRECATION")
+              private fun buildRecorder(src: Int, fd: java.io.FileDescriptor): MediaRecorder {
+                  val r = if (Build.VERSION.SDK_INT >= 31) MediaRecorder(this) else MediaRecorder()
+                  try {
+                      r.setAudioSource(src)
+                      r.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                      r.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                      r.setAudioEncodingBitRate(settings.kbps * 1000)
+                      r.setAudioSamplingRate(44100)
+                      r.setAudioChannels(1)
+                      r.setOutputFile(fd)
+                      r.prepare()
+                      r.start()
+                  } catch (e: Exception) {
+                      try {
+                          r.release()
+                      } catch (e2: Exception) {
+                      }
+                      throw e
+                  }
+                  return r
+              }
+
+              private fun startRec(call: Boolean) {
+                  if (CR.recording) return
+                  settings = Prefs.load(this)
+                  if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                      Toast.makeText(this, t("Microphone permission needed", "মাইক পারমিশন দরকার"), Toast.LENGTH_LONG).show()
+                      return
+                  }
+                  try {
+                      val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+                      val name = (if (call) "CALL" else "REC") + "_Unknown_" + ts + ".m4a"
+                      val v = ContentValues()
+                      v.put(MediaStore.Audio.Media.DISPLAY_NAME, name)
+                      v.put(MediaStore.Audio.Media.MIME_TYPE, "audio/mp4")
+                      v.put(MediaStore.Audio.Media.RELATIVE_PATH, Environment.DIRECTORY_MUSIC + "/CallRecorder")
+                      v.put(MediaStore.Audio.Media.IS_PENDING, 1)
+                      val uri = contentResolver.insert(MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), v)
+                      if (uri == null) {
+                          Toast.makeText(this, t("Cannot create file", "ফাইল তৈরি করা যায়নি"), Toast.LENGTH_LONG).show()
+                          return
+                      }
+                      outUri = uri
+                      val p = contentResolver.openFileDescriptor(uri, "rw")
+                      pfd = p
+                      var r: MediaRecorder
+                      try {
+                          r = buildRecorder(sourceConst(settings.source), p!!.fileDescriptor)
+                      } catch (e: Exception) {
+                          r = buildRecorder(MediaRecorder.AudioSource.MIC, p!!.fileDescriptor)
+                      }
+                      recorder = r
+                      isCall = call
+                      peak = 0
+                      recStartMs = SystemClock.elapsedRealtime()
+                      CR.elapsedMs = 0L
+                      CR.silentWarn = false
+                      CR.recording = true
+                      handler.removeCallbacks(ticker)
+                      handler.post(ticker)
+                      updateNotification()
+                  } catch (e: Exception) {
+                      Toast.makeText(this, t("Recorder error: ", "রেকর্ডার সমস্যা: ") + e.message, Toast.LENGTH_LONG).show()
+                      discardOutput()
+                      CR.recording = false
+                      afterFinish()
+                  }
+              }
+
+              private fun discardOutput() {
+                  try {
+                      pfd?.close()
+                  } catch (e: Exception) {
+                  }
+                  pfd = null
+                  val u = outUri
+                  outUri = null
+                  if (u != null) {
+                      try {
+                          contentResolver.delete(u, null, null)
+                      } catch (e: Exception) {
+                      }
+                  }
+              }
+
+              private fun stopRec() {
+                  if (!CR.recording) return
+                  handler.removeCallbacks(ticker)
+                  val r = recorder
+                  recorder = null
+                  CR.recording = false
+                  var ok = true
+                  try {
+                      val a = r?.maxAmplitude ?: 0
+                      if (a > peak) peak = a
+                  } catch (e: Exception) {
+                  }
+                  try {
+                      r?.stop()
+                  } catch (e: Exception) {
+                      ok = false
+                  }
+                  try {
+                      r?.release()
+                  } catch (e: Exception) {
+                  }
+                  try {
+                      pfd?.close()
+                  } catch (e: Exception) {
+                  }
+                  pfd = null
+                  val dur = SystemClock.elapsedRealtime() - recStartMs
+                  val uri = outUri
+                  outUri = null
+                  val wasCall = isCall
+                  val silent = peak < 40
+                  val startedAt = Date(System.currentTimeMillis() - dur)
+                  if (uri == null) {
+                      afterFinish()
+                      return
+                  }
+                  if (!ok || dur < 3000) {
+                      try {
+                          contentResolver.delete(uri, null, null)
+                      } catch (e: Exception) {
+                      }
+                      afterFinish()
+                      return
+                  }
+                  updateNotification()
+                  Thread {
+                      try {
+                          if (wasCall) Thread.sleep(1800)
+                          var dir = "CALL"
+                          var label = "Unknown"
+                          if (wasCall) {
+                              val info = lookupLastCall()
+                              if (info != null) {
+                                  dir = info.first
+                                  label = info.second
+                              }
+                          } else {
+                              dir = "REC"
+                              label = "Manual"
+                          }
+                          if (silent) dir += "S"
+                          val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(startedAt)
+                          val v = ContentValues()
+                          v.put(MediaStore.Audio.Media.DISPLAY_NAME, dir + "_" + label + "_" + ts + ".m4a")
+                          v.put(MediaStore.Audio.Media.IS_PENDING, 0)
+                          contentResolver.update(uri, v, null, null)
+                      } catch (e: Exception) {
+                          try {
+                              val v2 = ContentValues()
+                              v2.put(MediaStore.Audio.Media.IS_PENDING, 0)
+                              contentResolver.update(uri, v2, null, null)
+                          } catch (e2: Exception) {
+                          }
+                      }
+                      handler.post {
+                          CR.silentWarn = silent
+                          CR.libraryVersion = CR.libraryVersion + 1
+                          showDone(uri, silent)
+                          afterFinish()
+                      }
+                  }.start()
+              }
+
+              private fun afterFinish() {
+                  if (CR.listening) {
+                      updateNotification()
+                  } else {
+                      try {
+                          stopForeground(STOP_FOREGROUND_REMOVE)
+                      } catch (e: Exception) {
+                      }
+                      stopSelf()
+                  }
+              }
+
+              private fun lookupLastCall(): Pair<String, String>? {
+                  if (checkSelfPermission(android.Manifest.permission.READ_CALL_LOG) != PackageManager.PERMISSION_GRANTED) return null
+                  try {
+                      val args = Bundle()
+                      args.putInt(ContentResolver.QUERY_ARG_LIMIT, 1)
+                      args.putStringArray(ContentResolver.QUERY_ARG_SORT_COLUMNS, arrayOf(CallLog.Calls.DATE))
+                      args.putInt(ContentResolver.QUERY_ARG_SORT_DIRECTION, ContentResolver.QUERY_SORT_DIRECTION_DESCENDING)
+                      contentResolver.query(
+                          CallLog.Calls.CONTENT_URI,
+                          arrayOf(CallLog.Calls.NUMBER, CallLog.Calls.CACHED_NAME, CallLog.Calls.TYPE),
+                          args, null
+                      )?.use { c ->
+                          if (c.moveToFirst()) {
+                              val number = c.getString(0) ?: ""
+                              val name = c.getString(1) ?: ""
+                              val type = c.getInt(2)
+                              val dir = if (type == CallLog.Calls.OUTGOING_TYPE) "OUT" else "IN"
+                              var label = if (name.isNotEmpty()) name else number
+                              label = label.replace(Regex("[^\\p{L}\\p{N}+ -]"), "").trim().replace(" ", "-")
+                              if (label.isEmpty()) label = "Unknown"
+                              return Pair(dir, label)
+                          }
+                      }
+                  } catch (e: Exception) {
+                  }
+                  return null
+              }
+
+              // ---------------------------------------------------------- notifications
+              private fun createChannels() {
+                  val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+                  nm.createNotificationChannel(NotificationChannel(CH_REC, "Call recording", NotificationManager.IMPORTANCE_LOW))
+                  nm.createNotificationChannel(NotificationChannel(CH_DONE, "Saved recordings", NotificationManager.IMPORTANCE_DEFAULT))
+              }
+
+              private fun servicePi(action: String, rc: Int): PendingIntent {
+                  val i = Intent(this, CallRecService::class.java)
+                  i.action = action
+                  return PendingIntent.getService(this, rc, i, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+              }
+
+              private fun buildNotification(): Notification {
+                  val open = PendingIntent.getActivity(
+                      this, 0,
+                      Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_NEW_TASK),
+                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                  )
+                  val icon = Icon.createWithResource(this, R.drawable.ic_stat)
+                  val rec = CR.recording
+                  val b = Notification.Builder(this, CH_REC)
+                      .setSmallIcon(R.drawable.ic_stat)
+                      .setContentTitle(if (rec) t("Recording...", "রেকর্ড হচ্ছে...") else t("Auto call recording is ON", "অটো কল রেকর্ডিং চালু আছে"))
+                      .setContentText(if (rec) t("Tap Stop to finish", "শেষ করতে Stop চাপুন") else t("Waiting for calls", "কলের অপেক্ষায়"))
+                      .setContentIntent(open)
+                      .setOngoing(true)
+                      .setOnlyAlertOnce(true)
+                  if (rec) {
+                      b.setShowWhen(true)
+                      b.setWhen(System.currentTimeMillis() - CR.elapsedMs)
+                      b.setUsesChronometer(true)
+                      b.addAction(Notification.Action.Builder(icon, t("Stop", "বন্ধ"), servicePi(ACTION_REC_STOP, 1)).build())
+                  } else if (CR.listening) {
+                      b.addAction(Notification.Action.Builder(icon, t("Turn off", "বন্ধ করুন"), servicePi(ACTION_STOP_LISTEN, 2)).build())
+                  }
+                  if (Build.VERSION.SDK_INT >= 31) {
+                      b.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)
+                  }
+                  return b.build()
+              }
+
+              private fun updateNotification() {
+                  if (!fgOk) return
+                  try {
+                      val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+                      nm.notify(NID, buildNotification())
+                  } catch (e: Exception) {
+                  }
+              }
+
+              private fun showDone(uri: Uri, silent: Boolean) {
+                  try {
+                      val view = Intent(Intent.ACTION_VIEW)
+                      view.setDataAndType(uri, "audio/mp4")
+                      view.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                      val pi = PendingIntent.getActivity(this, 5, view, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+                      val text = if (silent) t(
+                          "Sounded silent - try another audio source or use speakerphone",
+                          "সাউন্ড আসেনি - অন্য অডিও সোর্স বা স্পিকার ব্যবহার করে দেখুন"
+                      ) else t("Tap to play", "শুনতে ট্যাপ করুন")
+                      val n = Notification.Builder(this, CH_DONE)
+                          .setSmallIcon(R.drawable.ic_stat)
+                          .setContentTitle(t("Recording saved", "রেকর্ডিং সেভ হয়েছে"))
+                          .setContentText(text)
+                          .setContentIntent(pi)
+                          .setAutoCancel(true)
+                          .build()
+                      (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).notify(DONE_ID, n)
+                  } catch (e: Exception) {
+                  }
+              }
+
+              override fun onDestroy() {
+                  handler.removeCallbacksAndMessages(null)
+                  unregisterCalls()
+                  super.onDestroy()
+              }
+          }
+          KTEOF
+          cat > CallRecorderPro/app/src/main/java/com/hiddeninfo/callrecorder/MainActivity.kt <<'KTEOF'
+          package com.hiddeninfo.callrecorder
+
+          import android.Manifest
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.widget.Toast
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.setValue
+
+          class MainActivity : ComponentActivity() {
+
+              private var settings by mutableStateOf(CallSettings())
+              private var pendingAction = 0   // 1 = auto listen, 2 = manual record
+
+              private val permLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { _ ->
+                  continueAfterPermissions()
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  settings = Prefs.load(this)
+                  setContent {
+                      AppTheme {
+                          Root(
+                              s = settings,
+                              onSettings = { settings = it; Prefs.save(this@MainActivity, it) },
+                              onToggleAuto = { on -> if (on) requestAuto() else send(CallRecService.ACTION_STOP_LISTEN) },
+                              onManual = { pendingAction = 2; ensurePermissions() },
+                              onManualStop = { send(CallRecService.ACTION_REC_STOP) }
+                          )
+                      }
+                  }
+              }
+
+              private fun requestAuto() {
+                  pendingAction = 1
+                  ensurePermissions()
+              }
+
+              private fun has(p: String) = checkSelfPermission(p) == PackageManager.PERMISSION_GRANTED
+
+              private fun ensurePermissions() {
+                  val need = ArrayList<String>()
+                  if (!has(Manifest.permission.RECORD_AUDIO)) need.add(Manifest.permission.RECORD_AUDIO)
+                  if (pendingAction == 1) {
+                      if (!has(Manifest.permission.READ_PHONE_STATE)) need.add(Manifest.permission.READ_PHONE_STATE)
+                      if (!has(Manifest.permission.READ_CALL_LOG)) need.add(Manifest.permission.READ_CALL_LOG)
+                  }
+                  if (Build.VERSION.SDK_INT >= 33 && !has(Manifest.permission.POST_NOTIFICATIONS)) {
+                      need.add(Manifest.permission.POST_NOTIFICATIONS)
+                  }
+                  if (need.isEmpty()) continueAfterPermissions() else permLauncher.launch(need.toTypedArray())
+              }
+
+              private fun continueAfterPermissions() {
+                  val bn = settings.bengali
+                  if (!has(Manifest.permission.RECORD_AUDIO)) {
+                      Toast.makeText(this, tr(bn, "Microphone permission is required", "মাইক পারমিশন লাগবে"), Toast.LENGTH_LONG).show()
+                      return
+                  }
+                  if (pendingAction == 1) {
+                      if (!has(Manifest.permission.READ_PHONE_STATE)) {
+                          Toast.makeText(this, tr(bn, "Phone permission is required", "ফোন পারমিশন লাগবে"), Toast.LENGTH_LONG).show()
+                          return
+                      }
+                      startFg(CallRecService.ACTION_LISTEN)
+                  } else if (pendingAction == 2) {
+                      startFg(CallRecService.ACTION_REC_NOW)
+                  }
+                  pendingAction = 0
+              }
+
+              private fun startFg(action: String) {
+                  val i = Intent(this, CallRecService::class.java)
+                  i.action = action
+                  startForegroundService(i)
+              }
+
+              private fun send(action: String) {
+                  try {
+                      val i = Intent(this, CallRecService::class.java)
+                      i.action = action
+                      startService(i)
+                  } catch (e: Exception) {
+                  }
+              }
+
+              override fun onDestroy() {
+                  Player.stop()
+                  super.onDestroy()
+              }
+          }
+          KTEOF
+          cat > CallRecorderPro/app/src/main/java/com/hiddeninfo/callrecorder/Prefs.kt <<'KTEOF'
+          package com.hiddeninfo.callrecorder
+
+          import android.content.Context
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableIntStateOf
+          import androidx.compose.runtime.mutableLongStateOf
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.setValue
+
+          data class CallSettings(
+              val source: Int = 0,      // 0 mic, 1 voice recognition, 2 voice communication, 3 camcorder, 4 unprocessed
+              val kbps: Int = 64,
+              val bengali: Boolean = true,
+              val consent: Boolean = false
+          )
+
+          object CR {
+              var listening by mutableStateOf(false)
+              var recording by mutableStateOf(false)
+              var elapsedMs by mutableLongStateOf(0L)
+              var libraryVersion by mutableIntStateOf(0)
+              var silentWarn by mutableStateOf(false)
+          }
+
+          object Prefs {
+              private fun sp(c: Context) = c.getSharedPreferences("crp_settings", Context.MODE_PRIVATE)
+
+              fun load(c: Context): CallSettings {
+                  val p = sp(c)
+                  val d = CallSettings()
+                  return CallSettings(
+                      source = p.getInt("src", d.source),
+                      kbps = p.getInt("kbps", d.kbps),
+                      bengali = p.getBoolean("bn", d.bengali),
+                      consent = p.getBoolean("consent", d.consent)
+                  )
+              }
+
+              fun save(c: Context, s: CallSettings) {
+                  sp(c).edit()
+                      .putInt("src", s.source)
+                      .putInt("kbps", s.kbps)
+                      .putBoolean("bn", s.bengali)
+                      .putBoolean("consent", s.consent)
+                      .apply()
+              }
+          }
+          KTEOF
+          cat > CallRecorderPro/app/src/main/java/com/hiddeninfo/callrecorder/Ui.kt <<'KTEOF'
+          package com.hiddeninfo.callrecorder
+
+          import android.content.ContentUris
+          import android.content.Context
+          import android.content.Intent
+          import android.media.MediaPlayer
+          import android.net.Uri
+          import android.provider.MediaStore
+          import android.widget.Toast
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.horizontalScroll
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.ColumnScope
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.size
+          import androidx.compose.foundation.layout.width
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material3.AlertDialog
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.NavigationBar
+          import androidx.compose.material3.NavigationBarItem
+          import androidx.compose.material3.NavigationBarItemDefaults
+          import androidx.compose.material3.OutlinedTextField
+          import androidx.compose.material3.Scaffold
+          import androidx.compose.material3.Switch
+          import androidx.compose.material3.SwitchDefaults
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.TextButton
+          import androidx.compose.material3.darkColorScheme
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.LaunchedEffect
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableIntStateOf
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextAlign
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          object C {
+              val Bg = Color(0xFF0B0F1A)
+              val Surface = Color(0xFF141B2D)
+              val Card = Color(0xFF1B2440)
+              val Accent = Color(0xFF22C55E)
+              val Rec = Color(0xFFFF3B5C)
+              val Accent2 = Color(0xFF7C4DFF)
+              val Text = Color(0xFFEAF0FF)
+              val Muted = Color(0xFF8D98B5)
+              val Line = Color(0xFF2A3558)
+          }
+
+          fun tr(bn: Boolean, en: String, b: String): String = if (bn) b else en
+
+          fun fmtTime(ms: Long): String {
+              val s = ms / 1000
+              val h = s / 3600
+              val m = (s % 3600) / 60
+              val sec = s % 60
+              return if (h > 0) String.format(Locale.US, "%d:%02d:%02d", h, m, sec)
+              else String.format(Locale.US, "%02d:%02d", m, sec)
+          }
+
+          @Composable
+          fun AppTheme(content: @Composable () -> Unit) {
+              MaterialTheme(
+                  colorScheme = darkColorScheme(
+                      primary = C.Accent,
+                      secondary = C.Accent2,
+                      background = C.Bg,
+                      surface = C.Surface,
+                      onBackground = C.Text,
+                      onSurface = C.Text,
+                      onPrimary = Color.White
+                  ),
+                  content = content
+              )
+          }
+
+          @Composable
+          fun PillButton(label: String, color: Color, onClick: () -> Unit) {
+              Box(
+                  Modifier
+                      .clip(RoundedCornerShape(50))
+                      .background(color)
+                      .clickable { onClick() }
+                      .padding(horizontal = 22.dp, vertical = 12.dp),
+                  contentAlignment = Alignment.Center
+              ) {
+                  Text(label, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+              }
+          }
+
+          @Composable
+          fun SectionCard(title: String, content: @Composable ColumnScope.() -> Unit) {
+              Column(
+                  Modifier
+                      .fillMaxWidth()
+                      .clip(RoundedCornerShape(20.dp))
+                      .background(C.Card)
+                      .padding(16.dp)
+              ) {
+                  Text(title, color = C.Text, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                  Spacer(Modifier.height(6.dp))
+                  content()
+              }
+          }
+
+          @Composable
+          fun OptionRow(title: String, options: List<Pair<String, Int>>, selected: Int, onSelect: (Int) -> Unit) {
+              Column(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+                  Text(title, color = C.Muted, fontSize = 13.sp)
+                  Spacer(Modifier.height(8.dp))
+                  Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                      options.forEach { (label, v) ->
+                          val sel = v == selected
+                          Box(
+                              Modifier
+                                  .clip(RoundedCornerShape(50))
+                                  .background(if (sel) C.Accent else C.Line)
+                                  .clickable { onSelect(v) }
+                                  .padding(horizontal = 16.dp, vertical = 9.dp)
+                          ) {
+                              Text(label, color = Color.White, fontSize = 14.sp, fontWeight = if (sel) FontWeight.Bold else FontWeight.Normal)
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun ToggleRow(title: String, sub: String, checked: Boolean, onChecked: (Boolean) -> Unit) {
+              Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                  Column(Modifier.weight(1f)) {
+                      Text(title, color = C.Text, fontSize = 16.sp, fontWeight = FontWeight.Medium)
+                      if (sub.isNotEmpty()) Text(sub, color = C.Muted, fontSize = 12.sp)
+                  }
+                  Switch(
+                      checked = checked,
+                      onCheckedChange = onChecked,
+                      colors = SwitchDefaults.colors(checkedTrackColor = C.Accent, checkedThumbColor = Color.White)
+                  )
+              }
+          }
+
+          // ----------------------------------------------------------------- player
+          object Player {
+              private var mp: MediaPlayer? = null
+              var current by mutableStateOf<Uri?>(null)
+
+              fun stop() {
+                  try {
+                      mp?.stop()
+                  } catch (e: Exception) {
+                  }
+                  try {
+                      mp?.release()
+                  } catch (e: Exception) {
+                  }
+                  mp = null
+                  current = null
+              }
+
+              fun toggle(ctx: Context, uri: Uri) {
+                  if (current == uri) {
+                      stop()
+                      return
+                  }
+                  stop()
+                  try {
+                      val p = MediaPlayer()
+                      p.setDataSource(ctx, uri)
+                      p.setOnCompletionListener { stop() }
+                      p.prepare()
+                      p.start()
+                      mp = p
+                      current = uri
+                  } catch (e: Exception) {
+                      Toast.makeText(ctx, "Cannot play", Toast.LENGTH_SHORT).show()
+                      stop()
+                  }
+              }
+          }
+
+          // ------------------------------------------------------------------- root
+          @Composable
+          fun Root(
+              s: CallSettings,
+              onSettings: (CallSettings) -> Unit,
+              onToggleAuto: (Boolean) -> Unit,
+              onManual: () -> Unit,
+              onManualStop: () -> Unit
+          ) {
+              var tab by remember { mutableIntStateOf(0) }
+              val bn = s.bengali
+              val tabs = listOf(
+                  "📞" to tr(bn, "Home", "হোম"),
+                  "🎧" to tr(bn, "Recordings", "রেকর্ডিং"),
+                  "⚙️" to tr(bn, "Settings", "সেটিংস")
+              )
+              Scaffold(
+                  containerColor = C.Bg,
+                  bottomBar = {
+                      NavigationBar(containerColor = C.Surface) {
+                          tabs.forEachIndexed { i, (ic, label) ->
+                              NavigationBarItem(
+                                  selected = tab == i,
+                                  onClick = { tab = i },
+                                  icon = { Text(ic, fontSize = 20.sp) },
+                                  label = { Text(label, fontSize = 12.sp) },
+                                  colors = NavigationBarItemDefaults.colors(
+                                      indicatorColor = C.Line,
+                                      selectedTextColor = C.Accent,
+                                      unselectedTextColor = C.Muted
+                                  )
+                              )
+                          }
+                      }
+                  }
+              ) { pad ->
+                  Box(Modifier.padding(pad).fillMaxSize()) {
+                      when (tab) {
+                          0 -> HomeScreen(bn, onToggleAuto, onManual, onManualStop)
+                          1 -> RecordingsScreen(bn)
+                          else -> SettingsScreen(s, onSettings)
+                      }
+                  }
+              }
+          }
+
+          // ------------------------------------------------------------------- home
+          @Composable
+          fun HomeScreen(bn: Boolean, onToggleAuto: (Boolean) -> Unit, onManual: () -> Unit, onManualStop: () -> Unit) {
+              val on = CR.listening
+              val rec = CR.recording
+              Column(
+                  Modifier
+                      .fillMaxSize()
+                      .background(Brush.verticalGradient(listOf(C.Bg, Color(0xFF10223A))))
+                      .verticalScroll(rememberScrollState())
+                      .padding(18.dp),
+                  verticalArrangement = Arrangement.spacedBy(14.dp)
+              ) {
+                  Text("Call Recorder Pro", color = C.Text, fontSize = 24.sp, fontWeight = FontWeight.Bold)
+
+                  Column(
+                      Modifier
+                          .fillMaxWidth()
+                          .clip(RoundedCornerShape(22.dp))
+                          .background(C.Card)
+                          .padding(18.dp),
+                      horizontalAlignment = Alignment.CenterHorizontally
+                  ) {
+                      Box(
+                          Modifier
+                              .size(96.dp)
+                              .clip(CircleShape)
+                              .background(if (rec) C.Rec else if (on) C.Accent else C.Line),
+                          contentAlignment = Alignment.Center
+                      ) {
+                          Text(if (rec) "🔴" else "📞", fontSize = 40.sp)
+                      }
+                      Spacer(Modifier.height(10.dp))
+                      if (rec) {
+                          Text(fmtTime(CR.elapsedMs), color = C.Text, fontSize = 38.sp, fontWeight = FontWeight.Bold)
+                          Text(tr(bn, "Recording...", "রেকর্ড হচ্ছে..."), color = C.Rec, fontSize = 14.sp)
+                      } else {
+                          Text(
+                              if (on) tr(bn, "Auto recording is ON", "অটো রেকর্ডিং চালু") else tr(bn, "Auto recording is OFF", "অটো রেকর্ডিং বন্ধ"),
+                              color = C.Text, fontSize = 18.sp, fontWeight = FontWeight.Bold
+                          )
+                          Text(
+                              if (on) tr(bn, "Every call will be recorded automatically", "প্রতিটা কল নিজে থেকেই রেকর্ড হবে")
+                              else tr(bn, "Turn on to record calls", "কল রেকর্ড করতে চালু করুন"),
+                              color = C.Muted, fontSize = 13.sp, textAlign = TextAlign.Center
+                          )
+                      }
+                      Spacer(Modifier.height(8.dp))
+                      ToggleRow(tr(bn, "Auto record calls", "অটো কল রেকর্ড"), "", on) { onToggleAuto(it) }
+                      Spacer(Modifier.height(4.dp))
+                      if (rec) PillButton(tr(bn, "⏹ Stop recording", "⏹ রেকর্ড বন্ধ"), C.Rec, onManualStop)
+                      else PillButton(tr(bn, "🎙 Record now (test)", "🎙 এখনই রেকর্ড (টেস্ট)"), C.Accent2, onManual)
+                  }
+
+                  if (CR.silentWarn) {
+                      Column(
+                          Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(Color(0xFF3A1F2B)).padding(14.dp)
+                      ) {
+                          Text(tr(bn, "⚠ Last recording sounded silent", "⚠ শেষ রেকর্ডিংয়ে সাউন্ড আসেনি"), color = C.Rec, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                          Spacer(Modifier.height(4.dp))
+                          Text(
+                              tr(
+                                  bn,
+                                  "Your phone blocked the mic during the call. Put the call on speakerphone or try another audio source in Settings.",
+                                  "কলের সময় ফোন মাইক ব্লক করেছে। কল স্পিকারে দিন, অথবা সেটিংসে অন্য অডিও সোর্স বেছে নিন।"
+                              ),
+                              color = C.Text, fontSize = 12.sp, lineHeight = 17.sp
+                          )
+                      }
+                  }
+
+                  SectionCard(tr(bn, "💡 For best results (Samsung)", "💡 ভালো ফলাফলের জন্য (Samsung)")) {
+                      val tips = listOf(
+                          tr(bn, "Use speakerphone so the mic can pick up both sides.", "কল স্পিকারে রাখুন, তাহলে মাইকে দুই পাশের আওয়াজ আসবে।"),
+                          tr(bn, "Settings > Battery > this app > Unrestricted, so it isn't killed.", "Settings > Battery > এই অ্যাপ > Unrestricted করুন, যেন অ্যাপ বন্ধ না হয়ে যায়।"),
+                          tr(bn, "After a phone restart, open the app and turn Auto record on again.", "ফোন রিস্টার্ট হলে অ্যাপ খুলে অটো রেকর্ড আবার চালু করুন।"),
+                          tr(bn, "Make a short test call first and play it back.", "আগে ছোট একটা টেস্ট কল করে রেকর্ডিং শুনে নিন।")
+                      )
+                      tips.forEach { Text("•  " + it, color = C.Muted, fontSize = 12.sp, lineHeight = 17.sp) }
+                  }
+              }
+          }
+
+          // --------------------------------------------------------------- recordings
+          data class RecItem(val uri: Uri, val name: String, val durMs: Long, val size: Long, val dateSec: Long)
+
+          fun loadRecs(ctx: Context): List<RecItem> {
+              val out = ArrayList<RecItem>()
+              val proj = arrayOf(
+                  MediaStore.Audio.Media._ID,
+                  MediaStore.Audio.Media.DISPLAY_NAME,
+                  MediaStore.Audio.Media.DURATION,
+                  MediaStore.Audio.Media.SIZE,
+                  MediaStore.Audio.Media.DATE_ADDED
+              )
+              try {
+                  ctx.contentResolver.query(
+                      MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                      proj,
+                      MediaStore.Audio.Media.RELATIVE_PATH + " LIKE ?",
+                      arrayOf("%CallRecorder%"),
+                      MediaStore.Audio.Media.DATE_ADDED + " DESC"
+                  )?.use { c ->
+                      while (c.moveToNext()) {
+                          out.add(
+                              RecItem(
+                                  ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, c.getLong(0)),
+                                  c.getString(1) ?: "rec.m4a",
+                                  c.getLong(2), c.getLong(3), c.getLong(4)
+                              )
+                          )
+                      }
+                  }
+              } catch (e: Exception) {
+              }
+              return out
+          }
+
+          fun shareRec(ctx: Context, uri: Uri) {
+              try {
+                  val i = Intent(Intent.ACTION_SEND)
+                  i.type = "audio/mp4"
+                  i.putExtra(Intent.EXTRA_STREAM, uri)
+                  i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                  ctx.startActivity(Intent.createChooser(i, "Share"))
+              } catch (e: Exception) {
+                  Toast.makeText(ctx, "Cannot share", Toast.LENGTH_SHORT).show()
+              }
+          }
+
+          @Composable
+          fun RecCard(r: RecItem, bn: Boolean, onDelete: () -> Unit) {
+              val ctx = LocalContext.current
+              val base = r.name.removeSuffix(".m4a")
+              val parts = base.split("_")
+              var dir = parts.getOrElse(0) { "CALL" }
+              val silent = dir.endsWith("S")
+              if (silent) dir = dir.dropLast(1)
+              val label = if (parts.size >= 4) parts.subList(1, parts.size - 2).joinToString(" ").replace("-", " ") else base
+              val badge = when (dir) {
+                  "IN" -> tr(bn, "Incoming", "ইনকামিং")
+                  "OUT" -> tr(bn, "Outgoing", "আউটগোয়িং")
+                  "REC" -> tr(bn, "Manual", "ম্যানুয়াল")
+                  else -> tr(bn, "Call", "কল")
+              }
+              val color = when (dir) {
+                  "IN" -> C.Accent
+                  "OUT" -> C.Accent2
+                  else -> C.Muted
+              }
+              val date = SimpleDateFormat("dd MMM yyyy, hh:mm a", Locale.getDefault()).format(Date(r.dateSec * 1000L))
+              val playing = Player.current == r.uri
+              Column(
+                  Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(C.Card).padding(12.dp)
+              ) {
+                  Row(verticalAlignment = Alignment.CenterVertically) {
+                      Box(
+                          Modifier.size(46.dp).clip(CircleShape).background(if (playing) C.Accent else C.Line)
+                              .clickable { Player.toggle(ctx, r.uri) },
+                          contentAlignment = Alignment.Center
+                      ) { Text(if (playing) "⏹" else "▶", fontSize = 18.sp, color = Color.White) }
+                      Spacer(Modifier.width(12.dp))
+                      Column(Modifier.weight(1f)) {
+                          Text(label, color = C.Text, fontSize = 15.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                          Row(verticalAlignment = Alignment.CenterVertically) {
+                              Text(badge, color = color, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                              Text("  •  " + fmtTime(r.durMs) + "  •  " + String.format(Locale.US, "%.1f MB", r.size / 1048576.0), color = C.Muted, fontSize = 12.sp)
+                          }
+                          Text(date + (if (silent) "  ⚠ " + tr(bn, "silent", "সাউন্ড নেই") else ""), color = C.Muted, fontSize = 12.sp)
+                      }
+                  }
+                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                      TextButton(onClick = { shareRec(ctx, r.uri) }) { Text("↗ " + tr(bn, "Share", "শেয়ার"), color = C.Accent2) }
+                      TextButton(onClick = onDelete) { Text("🗑 " + tr(bn, "Delete", "ডিলিট"), color = C.Muted) }
+                  }
+              }
+          }
+
+          @Composable
+          fun RecordingsScreen(bn: Boolean) {
+              val ctx = LocalContext.current
+              var recs by remember { mutableStateOf(listOf<RecItem>()) }
+              var toDelete by remember { mutableStateOf<RecItem?>(null) }
+              var tick by remember { mutableIntStateOf(0) }
+              var query by remember { mutableStateOf("") }
+
+              LaunchedEffect(tick, CR.libraryVersion) {
+                  recs = withContext(Dispatchers.IO) { loadRecs(ctx) }
+              }
+              val shown = if (query.isBlank()) recs else recs.filter { it.name.contains(query.trim(), ignoreCase = true) }
+
+              Column(Modifier.fillMaxSize().background(C.Bg).padding(16.dp)) {
+                  Text(tr(bn, "Recordings", "রেকর্ডিং"), color = C.Text, fontSize = 24.sp, fontWeight = FontWeight.Bold)
+                  Spacer(Modifier.height(10.dp))
+                  OutlinedTextField(
+                      value = query,
+                      onValueChange = { query = it },
+                      singleLine = true,
+                      modifier = Modifier.fillMaxWidth(),
+                      placeholder = { Text(tr(bn, "Search name or number", "নাম বা নম্বর খুঁজুন"), color = C.Muted) }
+                  )
+                  Spacer(Modifier.height(10.dp))
+                  if (shown.isEmpty()) {
+                      Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                          Text(tr(bn, "No recordings yet", "এখনো কোনো রেকর্ডিং নেই"), color = C.Muted, fontSize = 15.sp)
+                      }
+                  } else {
+                      LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                          items(shown, key = { it.uri.toString() }) { r ->
+                              RecCard(r, bn) { toDelete = r }
+                          }
+                      }
+                  }
+              }
+
+              val d = toDelete
+              if (d != null) {
+                  AlertDialog(
+                      onDismissRequest = { toDelete = null },
+                      containerColor = C.Card,
+                      title = { Text(tr(bn, "Delete recording?", "রেকর্ডিং ডিলিট করবেন?"), color = C.Text) },
+                      text = { Text(d.name, color = C.Muted) },
+                      confirmButton = {
+                          TextButton(onClick = {
+                              if (Player.current == d.uri) Player.stop()
+                              try {
+                                  ctx.contentResolver.delete(d.uri, null, null)
+                              } catch (e: Exception) {
+                                  Toast.makeText(ctx, "Cannot delete", Toast.LENGTH_SHORT).show()
+                              }
+                              toDelete = null
+                              tick += 1
+                          }) { Text(tr(bn, "Delete", "ডিলিট"), color = C.Rec) }
+                      },
+                      dismissButton = {
+                          TextButton(onClick = { toDelete = null }) { Text(tr(bn, "Cancel", "বাতিল"), color = C.Muted) }
+                      }
+                  )
+              }
+          }
+
+          // ----------------------------------------------------------------- settings
+          @Composable
+          fun SettingsScreen(s: CallSettings, onChange: (CallSettings) -> Unit) {
+              val bn = s.bengali
+              Column(
+                  Modifier.fillMaxSize().background(C.Bg).verticalScroll(rememberScrollState()).padding(16.dp),
+                  verticalArrangement = Arrangement.spacedBy(14.dp)
+              ) {
+                  Text(tr(bn, "Settings", "সেটিংস"), color = C.Text, fontSize = 24.sp, fontWeight = FontWeight.Bold)
+
+                  SectionCard(tr(bn, "🎙 Audio source", "🎙 অডিও সোর্স")) {
+                      OptionRow(
+                          tr(bn, "Try another one if recordings are silent", "রেকর্ডিংয়ে সাউন্ড না এলে অন্যটা চেষ্টা করুন"),
+                          listOf(
+                              tr(bn, "Mic", "মাইক") to 0,
+                              tr(bn, "Voice recognition", "ভয়েস রিকগনিশন") to 1,
+                              tr(bn, "Voice communication", "ভয়েস কমিউনিকেশন") to 2,
+                              tr(bn, "Camcorder", "ক্যামকর্ডার") to 3,
+                              tr(bn, "Unprocessed", "আনপ্রসেসড") to 4
+                          ),
+                          s.source
+                      ) { onChange(s.copy(source = it)) }
+                      Text(
+                          tr(
+                              bn,
+                              "Android blocks normal apps from the call audio, so results depend on your phone. Speakerphone gives the best result.",
+                              "Android সাধারণ অ্যাপকে কলের অডিও নিতে দেয় না, তাই ফলাফল ফোনভেদে আলাদা। স্পিকারে দিলে সবচেয়ে ভালো আসে।"
+                          ),
+                          color = C.Muted, fontSize = 12.sp
+                      )
+                  }
+
+                  SectionCard(tr(bn, "🎚 Quality", "🎚 কোয়ালিটি")) {
+                      OptionRow(
+                          tr(bn, "Bitrate", "বিটরেট"),
+                          listOf("32 kbps" to 32, "64 kbps" to 64, "128 kbps" to 128),
+                          s.kbps
+                      ) { onChange(s.copy(kbps = it)) }
+                      Text(tr(bn, "64 kbps is about 0.5 MB per minute.", "৬৪ kbps ≈ প্রতি মিনিটে ০.৫ MB।"), color = C.Muted, fontSize = 12.sp)
+                  }
+
+                  SectionCard(tr(bn, "🌐 App", "🌐 অ্যাপ")) {
+                      ToggleRow("বাংলা / English", tr(bn, "On = Bangla, Off = English", "চালু = বাংলা, বন্ধ = English"), s.bengali) {
+                          onChange(s.copy(bengali = it))
+                      }
+                  }
+
+                  SectionCard(tr(bn, "⚖ Legal", "⚖ আইনি বিষয়")) {
+                      Text(
+                          tr(
+                              bn,
+                              "Recording a call without the other person's consent may be illegal in your country. Use this app for your own notes or with permission, and tell the other person you are recording.",
+                              "অপর পক্ষের অনুমতি ছাড়া কল রেকর্ড করা আপনার দেশে বেআইনি হতে পারে। নিজের নোটের জন্য বা অনুমতি নিয়ে ব্যবহার করুন, আর রেকর্ড করছেন সেটা অপর পক্ষকে জানিয়ে দিন।"
+                          ),
+                          color = C.Muted, fontSize = 12.sp, lineHeight = 17.sp
+                      )
+                  }
+                  Spacer(Modifier.height(10.dp))
+              }
+          }
+          KTEOF
+          cat > CallRecorderPro/app/src/main/res/drawable/ic_launcher_fg.xml <<'KTEOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#FF22C55E"
+                  android:pathData="M54,54m-20,0a20,20 0 1,0 40,0a20,20 0 1,0 -40,0" />
+              <path
+                  android:fillColor="#00000000"
+                  android:strokeColor="#FFFFFFFF"
+                  android:strokeWidth="4"
+                  android:pathData="M54,54m-30,0a30,30 0 1,0 60,0a30,30 0 1,0 -60,0" />
+          </vector>
+          KTEOF
+          cat > CallRecorderPro/app/src/main/res/drawable/ic_stat.xml <<'KTEOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#FFFFFFFF"
+                  android:pathData="M12,12m-6,0a6,6 0 1,0 12,0a6,6 0 1,0 -12,0" />
+          </vector>
+          KTEOF
+          cat > CallRecorderPro/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'KTEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_bg" />
+              <foreground android:drawable="@drawable/ic_launcher_fg" />
+          </adaptive-icon>
+          KTEOF
+          cat > CallRecorderPro/app/src/main/res/values/colors.xml <<'KTEOF'
+          <resources>
+              <color name="bg">#FF0B0F1A</color>
+              <color name="surface">#FF141B2D</color>
+              <color name="ic_bg">#FF141B2D</color>
+          </resources>
+          KTEOF
+          cat > CallRecorderPro/app/src/main/res/values/strings.xml <<'KTEOF'
+          <resources>
+              <string name="app_name">Call Recorder Pro</string>
+          </resources>
+          KTEOF
+          cat > CallRecorderPro/app/src/main/res/values/themes.xml <<'KTEOF'
+          <resources>
+              <style name="Theme.App" parent="android:Theme.Material.NoActionBar">
+                  <item name="android:windowBackground">@color/bg</item>
+                  <item name="android:statusBarColor">@color/bg</item>
+                  <item name="android:navigationBarColor">@color/surface</item>
+              </style>
+          </resources>
+          KTEOF
+          cat > CallRecorderPro/build.gradle.kts <<'KTEOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          KTEOF
+          cat > CallRecorderPro/gradle.properties <<'KTEOF'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          KTEOF
+          cat > CallRecorderPro/settings.gradle.kts <<'KTEOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "CallRecorderPro"
+          include(":app")
+          KTEOF
+
+      - name: Build release APK
+        run: gradle -p CallRecorderPro :app:assembleRelease --stacktrace --no-daemon
+
+      - name: Rename APK
+        run: |
+          mkdir -p out
+          cp CallRecorderPro/app/build/outputs/apk/release/*.apk out/CallRecorderPro.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CallRecorderPro-APK
+          path: out/CallRecorderPro.apk
+
+      - name: Publish release
+        continue-on-error: true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Call Recorder Pro build ${{ github.run_number }}
+          files: out/CallRecorderPro.apk
